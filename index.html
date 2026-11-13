@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
@@ -27,191 +27,595 @@ button.ghost{background:transparent;color:#eef1f7;border:1px solid rgba(255,255,
 <div id="bar">灵敏度<input id="gain" type="range" min="0.8" max="2.5" step="0.1" value="1.4"><span id="gv">1.4</span><button class="ghost" id="inv">方向反了</button></div>
 <div id="actions" hidden><button id="water">水瓶</button><button id="oil">油瓶</button><button id="check" class="ghost">验收</button></div><div id="overlay"><div class="card" id="card"></div></div>
 <script>
-(function(){
-const $=id=>document.getElementById(id);
-const cv=$('c'),ctx=cv.getContext('2d');
-let W,H,s,B,G,A0;
-let state='intro';              // intro | calib | ready | play | result
-let level=1,target=0.5,tol=0.08;
-let vb=0.72,poured=0,spilled=0,parts=[],lastFlow=0,flowFrac=0;
-let theta=0,sm=0,alpha=0.2,sigma=0,dead=0.4;
-let gain=1.4,dir=1;
-let haveMotion=false,haveOri=false,motionAng=0,oriAng=0,base=0,useDrag=false,dragAng=0;
-let calibSamples=[],calibStart=0;
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const canvas = $('c'), ctx = canvas.getContext('2d');
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+const wrap = a => ((a + 540) % 360 + 360) % 360 - 180;
+let state = 'intro', level = 1, active = 0;
+let theta = 0, sm = 0, alpha = .2, sigma = 0, dead = .4;
+let gain = 1.4, direction = 1, useDrag = false, dragAngle = 0;
+let haveMotion = false, haveOrientation = false, motionAngle = 0, orientationAngle = 0, base = 0;
+let calibration = [], calibrationStart = 0, permission = '未请求';
+let gravityX = 0, gravityY = 9.81, gravityZ = 0, gravityReady = false;
+let accelerationX = 0, accelerationY = 0, motionTime = 0;
+let dragForceX = 0, dragForceY = 0, dragTime = 0;
 
-const wrap=a=>{while(a>180)a-=360;while(a<=-180)a+=360;return a;};
-
-/* ---------- 传感器 ---------- */
-function onMotion(e){const g=e.accelerationIncludingGravity;if(!g||g.x==null)return;if(Math.hypot(g.x,g.y)<2)return;motionAng=-Math.atan2(g.x,g.y)*180/Math.PI;haveMotion=true;}
-function onOri(e){if(e.gamma==null)return;oriAng=e.gamma;haveOri=true;}
-function diag(){return '浏览器支持:'+(window.DeviceOrientationEvent?'是':'否')+' 安全连接:'+(window.isSecureContext?'是':'否')+' 权限:'+(window.__perm||'未弹窗')+(/MicroMessenger/i.test(navigator.userAgent)?' (在微信里)':'');}
-function rawAng(){return haveMotion?motionAng:oriAng;}
-function enableSensors(){
-  const asks=[];
-  try{if(window.DeviceMotionEvent&&DeviceMotionEvent.requestPermission)asks.push(DeviceMotionEvent.requestPermission().catch(()=>{}));}catch(e){}
-  try{if(window.DeviceOrientationEvent&&DeviceOrientationEvent.requestPermission)asks.push(DeviceOrientationEvent.requestPermission().then(r=>{window.__perm=r;}).catch(e=>{window.__perm='出错';}));}catch(e){window.__perm='出错';}
-  addEventListener('devicemotion',onMotion);addEventListener('deviceorientation',onOri);
-  return Promise.all(asks);
+// World coordinates are CSS pixels in a 390 × 520 portrait viewport.
+const dt = 1 / 120, spacing = 4.5, h = 10, h2 = h * h;
+const iterations = 3, particleCount = 570, maxParticles = particleCount * 2;
+const cup = {left: 76, right: 320, top: 354, bottom: 466};
+const wallHalfWidth = 2, particleRadius = 1.55, contactDistance = wallHalfWidth + particleRadius;
+const particleArea = spacing * spacing * Math.sqrt(3) / 2;
+const capacity = (cup.right - cup.left - contactDistance * 2) *
+  (cup.bottom - cup.top - contactDistance) / particleArea;
+const outline = [[-13,0],[-13,14],[-45,30],[-45,155],[45,155],[45,30],[13,14],[13,0]];
+const cupOutline = [[76,354],[76,466],[320,466],[320,354]];
+const palette = ['#86d7ff', '#ffd276'];
+const x = new Float32Array(maxParticles), y = new Float32Array(maxParticles);
+const oldX = new Float32Array(maxParticles), oldY = new Float32Array(maxParticles);
+const vx = new Float32Array(maxParticles), vy = new Float32Array(maxParticles);
+const lambda = new Float32Array(maxParticles), density = new Float32Array(maxParticles);
+const deltaX = new Float32Array(maxParticles), deltaY = new Float32Array(maxParticles);
+const kind = new Uint8Array(maxParticles), alive = new Uint8Array(maxParticles);
+const departed = new Uint8Array(maxParticles), lost = new Uint8Array(maxParticles);
+const contactX = new Float32Array(maxParticles), contactY = new Float32Array(maxParticles);
+const wallVX = new Float32Array(maxParticles), wallVY = new Float32Array(maxParticles);
+const wetness = new Float32Array(maxParticles);
+const angles = new Float64Array(2), previousAngles = new Float64Array(2);
+const cosines = new Float64Array(2), sines = new Float64Array(2);
+const previousCosines = new Float64Array(2), previousSines = new Float64Array(2);
+const angularSpeed = new Float64Array(2);
+const counts = new Uint16Array(2), meanY = new Float64Array(2);
+// Fixed linked-cell storage. No per-step Maps, objects or particle allocations.
+const gridWidth = 100, gridHeight = 100, gridOffset = 300;
+const heads = new Int32Array(gridWidth * gridHeight), next = new Int32Array(maxParticles);
+const cellX = new Int16Array(maxParticles), cellY = new Int16Array(maxParticles);
+const neighborStride = 96, neighbors = new Uint16Array(maxParticles * neighborStride);
+const neighborCount = new Uint8Array(maxParticles);
+const phaseMoved = new Uint8Array(maxParticles);
+let phaseSteps = 0;
+let total = 0, spilled = 0, emitted = 0, flow = 0, simulationTime = 0;
+let oilStarted = false, waterFirst = true;
+let accumulator = 0, previousTime = performance.now(), fps = 60, frameCost = 0;
+let substepBudget = 2, slowFrames = 0, fastFrames = 0;
+let surfaceRestDensity = 0;
+// Calibrate the 2D poly6 kernel against the initial hexagonal lattice.
+for (let row = -3; row <= 3; row++) for (let col = -3; col <= 3; col++) {
+  const dx = (col + (Math.abs(row) % 2) * .5) * spacing;
+  const dy = row * spacing * Math.sqrt(3) / 2;
+  const q = Math.max(0, 1 - (dx * dx + dy * dy) / h2);
+  surfaceRestDensity += q * q * q;
 }
-
-/* ---------- 手指拖动(没有传感器时) ---------- */
-let lastX=null;
-cv.addEventListener('pointerdown',e=>{lastX=e.clientX;});
-cv.addEventListener('pointermove',e=>{if(lastX==null||!useDrag)return;dragAng=Math.max(-40,Math.min(150,dragAng+(e.clientX-lastX)*0.6));lastX=e.clientX;});
-addEventListener('pointerup',()=>{lastX=null;});
-
-$('gain').oninput=e=>{gain=+e.target.value;$('gv').textContent=gain.toFixed(1);};
-$('inv').onclick=()=>{dir=-dir;};
-
-/* ---------- 声音:倒水声,越满音调越高 ---------- */
-let actx,ng,filt;
-function initAudio(){
-  try{actx=new (window.AudioContext||window.webkitAudioContext)();
-    const len=actx.sampleRate*2,buf=actx.createBuffer(1,len,actx.sampleRate),d=buf.getChannelData(0);
-    for(let i=0;i<len;i++)d[i]=Math.random()*2-1;
-    const src=actx.createBufferSource();src.buffer=buf;src.loop=true;
-    filt=actx.createBiquadFilter();filt.type='bandpass';filt.Q.value=5;filt.frequency.value=400;
-    ng=actx.createGain();ng.gain.value=0;src.connect(filt);filt.connect(ng);ng.connect(actx.destination);src.start();
-  }catch(e){actx=null;}
+const inverseRestDensity = 1 / surfaceRestDensity;
+const referenceKernel = Math.pow(1 - .3 * .3, 3);
+function pivot(k) { return level === 1 ? 184 : 120 + k * 128; }
+function screenScale() { return Math.min(innerWidth / 390, innerHeight * .78 / 520); }
+function inertialInput(ax, ay, blend) {
+  const length = Math.hypot(ax, ay), scale = Math.min(1, 18 / (length || 1));
+  accelerationX += (ax * scale - accelerationX) * blend;
+  accelerationY += (ay * scale - accelerationY) * blend;
 }
-function ding(ok){if(!actx)return;try{const o=actx.createOscillator(),g=actx.createGain();o.frequency.value=ok?880:220;o.type=ok?'sine':'triangle';g.gain.setValueAtTime(0.25,actx.currentTime);g.gain.exponentialRampToValueAtTime(0.001,actx.currentTime+0.5);o.connect(g);g.connect(actx.destination);o.start();o.stop(actx.currentTime+0.5);}catch(e){}}
-
-/* ---------- 流程 ---------- */
-function show(html){$('card').innerHTML=html;$('overlay').classList.remove('hide');}
-function hide(){$('overlay').classList.add('hide');}
-function intro(){
-  show(`<h2>液体实验室</h2>
-  <p>1. 先把手机<b>锁定竖屏</b>(不然一歪屏幕就转了)</p>
-  <p>2. 手机向右倾斜,瓶子就会倒水</p>
-  <p>3. 对准刻度后回正瓶子，点<b>验收</b></p>
-  <p class="small">倒得越慢越好控制;快满时声音会变尖</p>
-  <button id="go">开始</button>`);
-  $('go').onclick=()=>{const p=enableSensors();screen.orientation?.lock?.("portrait").catch(()=>{});initAudio();show('<h2>正在打开传感器</h2><p class="small">如果弹窗,请点“允许”</p>');p.then(startCalib);};
-}
-function startCalib(){
-  show(`<h2>请拿稳手机</h2><p>正常竖着拿,别动,大约 1 秒</p><p class="small">在测这台手机的零点和抖动</p>`);
-  state='calib';calibSamples=[];calibStart=performance.now();
-}
-function finishCalib(){
-  if(!haveMotion&&!haveOri){useDrag=true;base=0;sigma=0;alpha=0.3;}
-  else{
-    let sx=0,sy=0;for(const a of calibSamples){sx+=Math.cos(a*Math.PI/180);sy+=Math.sin(a*Math.PI/180);}
-    base=Math.atan2(sy,sx)*180/Math.PI;
-    let v=0;for(const a of calibSamples){const d=wrap(a-base);v+=d*d;}
-    sigma=calibSamples.length?Math.sqrt(v/calibSamples.length):0;
-    alpha=Math.max(0.06,Math.min(0.3,0.3/(1+sigma*2)));   // 抖得越厉害,平滑越重
-    dead=Math.min(1.5,0.3+sigma);
+function onMotion(e) {
+  const now = performance.now(), elapsed = clamp((now - motionTime) / 1000, .005, .1);
+  motionTime = now;
+  const g = e.accelerationIncludingGravity, a = e.acceleration;
+  if (g && Number.isFinite(g.x) && Number.isFinite(g.y)) {
+    if (!gravityReady) { gravityX = g.x; gravityY = g.y; gravityZ = g.z || 0; gravityReady = true; }
+    const blend = 1 - Math.exp(-elapsed / .3);
+    gravityX += (g.x - gravityX) * blend;
+    gravityY += (g.y - gravityY) * blend;
+    gravityZ += ((g.z || 0) - gravityZ) * blend;
+    if (Math.hypot(gravityX, gravityY) > 2) {
+      motionAngle = -Math.atan2(gravityX, gravityY) * 180 / Math.PI;
+      haveMotion = true;
+    }
   }
-  sm=0;newCup(true);
-}
-const spacing=5, step=1/120, cup={left:76,right:320,top:354,bottom:466};
-const capacity=(cup.right-cup.left)*(cup.bottom-cup.top)/(spacing*spacing*.866);
-const outline=[[-13,0],[-13,14],[-45,30],[-45,155],[45,155],[45,30],[13,14],[13,0]];
-const palette=['#86d7ff','#ffd276'];
-let drops=[],angles=[0,0],active=0,counts=[0,0],means=[0,0],flow=0,acc=0,previous=performance.now();
-function pivot(k){return level===1?184:120+k*128}
-function choose(k){active=k;dragAng=sm=0;for(const [i,id] of ['water','oil'].entries())$(id).style.opacity=k===i?'1':'.55'}
-$('water').onclick=()=>choose(0);$('oil').onclick=()=>choose(1);
-function newCup(){
-  drops=[];angles=[0,0];counts=[0,0];choose(0);target=level===1?.32:.25;tol=.06;
-  for(let k=0;k<level;k++)for(let row=0;row<26;row++)for(let col=0;col<17;col++){
-    drops.push({x:pivot(k)-41+col*spacing+(row%2)*2.5,y:160+152-row*4.33,vx:0,vy:0,k,inside:k});
+  if (a && Number.isFinite(a.x) && Number.isFinite(a.y)) {
+    inertialInput(a.x, -a.y, 1 - Math.exp(-elapsed / .045));
+  } else if (g && Number.isFinite(g.x) && Number.isFinite(g.y)) {
+    inertialInput(g.x - gravityX, -(g.y - gravityY), 1 - Math.exp(-elapsed / .045));
   }
-  $('lv').textContent='液体实验室　/　0'+level;$('actions').hidden=false;$('oil').hidden=level===1;
-  state='ready';show('<h2>第 '+level+' 关</h2><p>'+goal()+'</p><p>'+ (useDrag?'左右拖动瓶身调节倾角。':'向右倾斜手机倒液。')+'回正后点验收。</p><button id="ok">开始倒液</button>');
-  $('ok').onclick=()=>{hide();state='play'};
 }
-function goal(){return level===1?'水 32% ±6%':'先水 25%，再油 20%，各允许 ±6%'}
-$('check').onclick=()=>{
-  const ok=Math.abs(counts[0]/capacity-target)<=tol&&(level===1||(Math.abs(counts[1]/capacity-.2)<=tol&&means[1]<means[0]));
-  state='result';ding(ok);show('<h2>'+(ok?'过关！':'还差一点')+'</h2><p>'+goal()+'</p><p>'+$('info').textContent+'</p><button id="retry">重新倒</button><button id="continue">'+(ok?(level===1?'下一关':'再玩一次'):'继续调整')+'</button>');
-  $('retry').onclick=newCup;$('continue').onclick=()=>{if(ok){level=3-level;newCup()}else{hide();state='play'}};
+function onOrientation(e) {
+  if (!Number.isFinite(e.gamma)) return;
+  orientationAngle = e.gamma; haveOrientation = true;
+}
+function rawAngle() { return haveMotion ? motionAngle : orientationAngle; }
+async function enableSensors() {
+  const requests = [];
+  for (const Sensor of [window.DeviceMotionEvent, window.DeviceOrientationEvent]) {
+    if (Sensor && typeof Sensor.requestPermission === 'function') {
+      requests.push(Sensor.requestPermission().catch(() => 'denied'));
+    }
+  }
+  const results = await Promise.all(requests);
+  permission = results.length ? results.join('/') : '无需弹窗';
+  addEventListener('devicemotion', onMotion);
+  addEventListener('deviceorientation', onOrientation);
+}
+let pointerId = null, pointerX = 0, pointerY = 0, pointerTime = 0, pointerVX = 0, pointerVY = 0;
+canvas.addEventListener('pointerdown', e => {
+  if (!useDrag || state !== 'play') return;
+  pointerId = e.pointerId; pointerX = e.clientX; pointerY = e.clientY;
+  pointerTime = e.timeStamp; pointerVX = pointerVY = 0;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (e.pointerId !== pointerId || !useDrag || state !== 'play') return;
+  const elapsed = clamp((e.timeStamp - pointerTime) / 1000, .008, .1);
+  const dx = (e.clientX - pointerX) / screenScale(), dy = (e.clientY - pointerY) / screenScale();
+  const speedX = dx / elapsed, speedY = dy / elapsed;
+  // Convert pointer acceleration to m/s², then use the same opposing force as the IMU.
+  dragForceX += (clamp((speedX - pointerVX) / elapsed / 100, -18, 18) - dragForceX) * .35;
+  dragForceY += (clamp((speedY - pointerVY) / elapsed / 100, -18, 18) - dragForceY) * .35;
+  dragTime = performance.now();
+  dragAngle = clamp(dragAngle + dx * .6, -70, 180);
+  pointerX = e.clientX; pointerY = e.clientY; pointerTime = e.timeStamp;
+  pointerVX = speedX; pointerVY = speedY;
+});
+function releasePointer(e) {
+  if (e.pointerId !== pointerId) return;
+  dragForceX = clamp(dragForceX - pointerVX / 12, -18, 18);
+  dragForceY = clamp(dragForceY - pointerVY / 12, -18, 18);
+  dragTime = performance.now(); pointerId = null;
+}
+canvas.addEventListener('pointerup', releasePointer);
+canvas.addEventListener('pointercancel', releasePointer);
+canvas.addEventListener('lostpointercapture', () => { pointerId = null; });
+$('gain').oninput = e => { gain = +e.target.value; $('gv').textContent = gain.toFixed(1); };
+$('inv').onclick = () => { direction *= -1; };
+
+let audio, noiseGain, filter;
+function initAudio() {
+  try {
+    if (audio) { audio.resume(); return; }
+    audio = new (window.AudioContext || window.webkitAudioContext)();
+    const buffer = audio.createBuffer(1, audio.sampleRate * 2, audio.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const source = audio.createBufferSource(); source.buffer = buffer; source.loop = true;
+    filter = audio.createBiquadFilter(); filter.type = 'bandpass'; filter.Q.value = 5;
+    noiseGain = audio.createGain(); noiseGain.gain.value = 0;
+    source.connect(filter); filter.connect(noiseGain); noiseGain.connect(audio.destination); source.start();
+    audio.resume();
+  } catch (e) { audio = null; }
+}
+function ding(ok) {
+  if (!audio) return;
+  const oscillator = audio.createOscillator(), volume = audio.createGain();
+  oscillator.frequency.value = ok ? 880 : 220; oscillator.type = ok ? 'sine' : 'triangle';
+  volume.gain.setValueAtTime(.2, audio.currentTime);
+  volume.gain.exponentialRampToValueAtTime(.001, audio.currentTime + .5);
+  oscillator.connect(volume); volume.connect(audio.destination);
+  oscillator.start(); oscillator.stop(audio.currentTime + .5);
+}
+function show(html) { $('card').innerHTML = html; $('overlay').classList.remove('hide'); }
+function hide() { $('overlay').classList.add('hide'); }
+function goal() { return level === 1 ? '水 32% ±6%' : '先水 25%，再油 20%，各允许 ±6%'; }
+function startCalibration() {
+  show('<h2>请拿稳手机</h2><p>竖着拿稳，正在测零点和抖动。</p><p class="small">没有传感器时自动进入手指模式</p>');
+  state = 'calib'; calibration = []; calibrationStart = performance.now();
+}
+function finishCalibration() {
+  if (!haveMotion && !haveOrientation) { useDrag = true; base = sigma = 0; alpha = .3; }
+  else {
+    let sx = 0, sy = 0, variance = 0;
+    for (const angle of calibration) { sx += Math.cos(angle * Math.PI / 180); sy += Math.sin(angle * Math.PI / 180); }
+    base = Math.atan2(sy, sx) * 180 / Math.PI;
+    for (const angle of calibration) variance += wrap(angle - base) ** 2;
+    sigma = Math.sqrt(variance / Math.max(1, calibration.length));
+    alpha = clamp(.3 / (1 + sigma * 2), .06, .3); dead = Math.min(1.5, .3 + sigma);
+  }
+  newCup();
+}
+function choose(k) {
+  active = k; dragAngle = sm = theta = 0;
+  for (const [i, id] of ['water', 'oil'].entries()) $(id).style.opacity = k === i ? '1' : '.55';
+}
+$('water').onclick = () => choose(0);
+$('oil').onclick = () => choose(1);
+function newCup() {
+  total = particleCount * level; spilled = emitted = flow = accumulator = simulationTime = 0;
+  oilStarted = false; waterFirst = true; phaseSteps = 0;
+  alive.fill(0); departed.fill(0); lost.fill(0); vx.fill(0); vy.fill(0);
+  angles.fill(0); previousAngles.fill(0); counts.fill(0); meanY.fill(0);
+  accelerationX = accelerationY = dragForceX = dragForceY = 0;
+  choose(0);
+  for (let k = 0; k < level; k++) for (let row = 0; row < 30; row++) for (let col = 0; col < 19; col++) {
+    const i = k * particleCount + row * 19 + col;
+    x[i] = pivot(k) - 41.6 + col * spacing + (row % 2) * spacing * .5;
+    y[i] = 310 - row * spacing * Math.sqrt(3) / 2;
+    kind[i] = k; alive[i] = 1;
+  }
+  $('lv').textContent = '第 ' + level + ' 杯'; $('actions').hidden = false; $('oil').hidden = level === 1;
+  state = 'ready';
+  show('<h2>第 ' + level + ' 关</h2><p>' + goal() + '</p><p>' +
+    (useDrag ? '左右拖动调倾角，上下或来回快速拖动可晃出水花。' : '向右倾斜手机倒液，快速晃动会溅出。') +
+    '</p><p class="small">回正后点验收 · 溅出须 ≤10%</p><button id="ok">开始倒液</button>');
+  $('ok').onclick = () => { hide(); state = 'play'; accumulator = 0; };
+}
+function spillFraction() { return spilled / Math.max(1, total); }
+function updateCounts() {
+  counts.fill(0); meanY.fill(0);
+  for (let i = 0; i < total; i++) if (alive[i] && !lost[i]) {
+    if (x[i] > cup.left + wallHalfWidth && x[i] < cup.right - wallHalfWidth &&
+        y[i] >= cup.top && y[i] < cup.bottom - wallHalfWidth) {
+      counts[kind[i]]++; meanY[kind[i]] += y[i];
+    }
+  }
+  for (let k = 0; k < 2; k++) meanY[k] /= Math.max(1, counts[k]);
+}
+$('check').onclick = () => {
+  updateCounts();
+  const tooMuchSpill = spillFraction() > .1;
+  const ok = !tooMuchSpill && Math.abs(counts[0] / capacity - (level === 1 ? .32 : .25)) <= .06 &&
+    (level === 1 || (waterFirst && Math.abs(counts[1] / capacity - .2) <= .06 && meanY[1] < meanY[0]));
+  state = 'result'; ding(ok);
+  show('<h2>' + (tooMuchSpill ? '倒太猛，洒了' : ok ? '过关！' : '还差一点') + '</h2><p>' + goal() +
+    '</p><p>' + hudText() + '</p>' + (level === 2 && !waterFirst ? '<p>这一杯需要先水后油</p>' : '') +
+    '<button id="retry">重新倒</button><button id="continue">' +
+    (ok ? (level === 1 ? '下一关' : '再玩一次') : '继续调整') + '</button>');
+  $('retry').onclick = newCup;
+  $('continue').onclick = () => { if (ok) { level = 3 - level; newCup(); } else { hide(); state = 'play'; } };
 };
-// Project onto the inward half-plane of each nearby wall segment.
-function wall(p,x,y,X,Y){
-  const dx=X-x,dy=Y-y,len=Math.hypot(dx,dy),nx=dy/len,ny=-dx/len;
-  const along=((p.x-x)*dx+(p.y-y)*dy)/len;
-  if(along< -2||along>len+2)return;
-  const d=(p.x-x)*nx+(p.y-y)*ny;
-  if(d<2&&d> -10){p.x+=(2-d)*nx;p.y+=(2-d)*ny}
-}
-function simulate(){
- const walls=[];
- for(let k=0;k<level;k++){
-   const desired=k===active?theta*Math.PI/180:0;
-   angles[k]+=Math.max(-.025,Math.min(.025,desired-angles[k]));
-   const c=Math.cos(angles[k]),s=Math.sin(angles[k]);
-   walls[k]=outline.map(([x,y])=>[pivot(k)+x*c-y*s,160+x*s+y*c]);
- }
- const grid=new Map(),h=7;
- for(const p of drops){
-   p.ox=p.x;p.oy=p.y;p.vy+=650*step;p.x+=p.vx*step;p.y+=p.vy*step;
-   const key=Math.floor(p.x/h)+512*Math.floor(p.y/h);
-   if(!grid.has(key))grid.set(key,[]);grid.get(key).push(p);
- }
- // Position-based short-range pressure, mass-weighted projection and pair viscosity.
- for(const p of drops){
-  const cell=Math.floor(p.x/h)+512*Math.floor(p.y/h);
-  for(let j=-1;j<=1;j++)for(let i=-1;i<=1;i++){
-   const bucket=grid.get(cell+i+j*512);if(!bucket)continue;
-   for(const q of bucket){
-    if(q.ox<p.ox||(q.ox===p.ox&&q.oy<=p.oy)||q.inside!==p.inside)continue;
-    const dx=q.x-p.x,dy=q.y-p.y,d=Math.hypot(dx,dy);
-    if(d>=h||d<.001)continue;
-    const mass=p.k?.78:1,other=q.k?.78:1,share=other/(mass+other);
-    const push=Math.max(0,(p.k===q.k?5:5.4)-d)*.85/d;
-    const visc=(p.k&&q.k?.24:.065)*(1-d/h)*step;
-    const sx=dx*push-(q.vx-p.vx)*visc,sy=dy*push-(q.vy-p.vy)*visc;
-    p.x-=sx*share;p.y-=sy*share;q.x+=sx*(1-share);q.y+=sy*(1-share);
-   }
+
+function buildNeighbors() {
+  heads.fill(-1); neighborCount.fill(0);
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    const cx = clamp(Math.floor((x[i] + gridOffset) / h), 1, gridWidth - 2);
+    const cy = clamp(Math.floor((y[i] + gridOffset) / h), 1, gridHeight - 2);
+    cellX[i] = cx; cellY[i] = cy;
+    const key = cx + cy * gridWidth; next[i] = heads[key]; heads[key] = i;
   }
- }
- counts=[0,0];means=[0,0];flow*=.98;
- for(const p of drops){
-  if(p.inside>=0){
-   const k=p.inside,poly=walls[k];for(let i=1;i<poly.length;i++)wall(p,...poly[i-1],...poly[i]);
-   if(-(p.x-pivot(k))*Math.sin(angles[k])+(p.y-160)*Math.cos(angles[k])<0){p.inside=-1;flow++}
-  }else{
-   const {left:l,right:r,top:t,bottom:b}=cup;
-   if(p.ox>=l&&p.ox<=r||p.oy<t){wall(p,l,t,l,b);wall(p,r,b,r,t)}
-   if(p.oy<=b)wall(p,l,b,r,b);
-   if(p.x>=l&&p.x<=r&&p.y>=t&&p.y<=b){counts[p.k]++;means[p.k]+=p.y}
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    let count = 0;
+    for (let cy = cellY[i] - 1; cy <= cellY[i] + 1; cy++) {
+      for (let cx = cellX[i] - 1; cx <= cellX[i] + 1; cx++) {
+        for (let j = heads[cx + cy * gridWidth]; j >= 0; j = next[j]) {
+          const dx = x[i] - x[j], dy = y[i] - y[j];
+          if (j !== i && dx * dx + dy * dy < h2 && count < neighborStride) neighbors[i * neighborStride + count++] = j;
+        }
+      }
+    }
+    neighborCount[i] = count;
   }
-  p.vx=Math.max(-360,Math.min(360,(p.x-p.ox)/step))*.998;p.vy=Math.max(-420,Math.min(420,(p.y-p.oy)/step))*.999;
- }
- drops=drops.filter(p=>p.y<570);means=means.map((n,k)=>n/(counts[k]||1));
 }
-const layer=document.createElement('canvas');layer.width=195;layer.height=260;
-const ink=layer.getContext('2d',{willReadFrequently:true});
-function draw(){
- const scale=Math.min(innerWidth/390,innerHeight*.78/520),dpr=Math.min(devicePixelRatio,2);
- if(cv.width!==Math.round(innerWidth*dpr)||cv.height!==Math.round(innerHeight*dpr)){cv.width=Math.round(innerWidth*dpr);cv.height=Math.round(innerHeight*dpr)}
- ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,innerWidth,innerHeight);
- ctx.save();ctx.translate((innerWidth-390*scale)/2,(innerHeight-520*scale)/2);ctx.scale(scale,scale);
- for(let k=0;k<level;k++){
-  ink.clearRect(0,0,195,260);ink.fillStyle=palette[k];ink.beginPath();
-  for(const p of drops)if(p.k===k){ink.moveTo(p.x/2+1.9,p.y/2);ink.arc(p.x/2,p.y/2,1.9,0,2*Math.PI)}
-  ink.fill();const img=ink.getImageData(0,0,195,260),data=img.data;
-  for(let i=data.length-1;i>=0;i-=4){const a=data[i];if(a<80)data[i]=0;else{data[i]=190;if(i>=780&&data[i-780]<80){data[i-3]=224;data[i-2]=241}}}
-  ink.putImageData(img,0,0);ctx.drawImage(layer,0,0,390,520);
- }
- ctx.lineWidth=2;ctx.lineJoin='round';
- for(let k=0;k<level;k++){ctx.save();ctx.translate(pivot(k),160);ctx.rotate(angles[k]);ctx.strokeStyle=palette[k];ctx.beginPath();outline.forEach(([x,y],i)=>i?ctx.lineTo(x,y):ctx.moveTo(x,y));ctx.stroke();ctx.restore()}
- ctx.strokeStyle='#c1d5df';ctx.beginPath();ctx.moveTo(76,354);ctx.lineTo(76,466);ctx.lineTo(320,466);ctx.lineTo(320,354);ctx.stroke();
- for(const [fraction,label] of (level===1?[[.32,'水 32%']]:[[.25,'水 25%'],[.45,'总量 45%']])){const y=466-112*fraction;ctx.fillStyle=ctx.strokeStyle='#e4edf4';ctx.setLineDash([3,5]);ctx.beginPath();ctx.moveTo(76,y);ctx.lineTo(320,y);ctx.stroke();ctx.font='11px sans-serif';ctx.fillText(label,12,y+4)}
- ctx.restore();ctx.fillStyle='#9caab9';ctx.font='11px sans-serif';ctx.fillText('倾斜 '+theta.toFixed(0)+'°　抖动 '+sigma.toFixed(2)+'°　'+(useDrag?'手指模式':'传感器'),14,innerHeight-47);
- $('info').textContent=counts.slice(0,level).map((n,i)=>(i?'油 ':'水 ')+Math.round(n/capacity*100)+'%').join('　');
+function solveDensity() {
+  buildNeighbors();
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    let rho = 1, gx = 0, gy = 0, gradientSum = 0;
+    const start = i * neighborStride;
+    for (let n = 0; n < neighborCount[i]; n++) {
+      const j = neighbors[start + n], dx = x[i] - x[j], dy = y[i] - y[j];
+      const q = Math.max(0, 1 - (dx * dx + dy * dy) / h2);
+      rho += q * q * q;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const spiky = Math.max(0, 1 - distance / h);
+      const gradient = -.6 * spiky * spiky * inverseRestDensity / Math.max(distance, .001);
+      const nx = gradient * dx, ny = gradient * dy;
+      gx += nx; gy += ny;
+      gradientSum += (nx * nx + ny * ny) / (kind[j] ? .78 : 1);
+    }
+    density[i] = rho * inverseRestDensity;
+    gradientSum += (gx * gx + gy * gy) / (kind[i] ? .78 : 1);
+    // Unilateral incompressibility leaves the free surface pressure-free.
+    lambda[i] = -Math.max(0, density[i] - 1) / (gradientSum + .002);
+  }
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    let correctionX = 0, correctionY = 0;
+    const start = i * neighborStride;
+    for (let n = 0; n < neighborCount[i]; n++) {
+      const j = neighbors[start + n], dx = x[i] - x[j], dy = y[i] - y[j];
+      const q = Math.max(0, 1 - (dx * dx + dy * dy) / h2);
+      const ratio = q * q * q / referenceKernel;
+      const scorr = -.15 * ratio * ratio * ratio * ratio;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const spiky = Math.max(0, 1 - distance / h);
+      const gradient = -.6 * spiky * spiky * inverseRestDensity / Math.max(distance, .001);
+      const pressure = (lambda[i] + lambda[j] + scorr) * gradient / (kind[i] ? .78 : 1);
+      correctionX += pressure * dx; correctionY += pressure * dy;
+    }
+    const limit = Math.min(1, 1.4 / (Math.hypot(correctionX, correctionY) || 1));
+    deltaX[i] = correctionX * limit; deltaY[i] = correctionY * limit;
+  }
+  for (let i = 0; i < total; i++) if (alive[i]) { x[i] += deltaX[i]; y[i] += deltaY[i]; }
 }
-function loop(now){
- const dt=Math.min(.033,(now-previous)/1000);previous=now;
- if(state==='calib'){if(haveMotion||haveOri)calibSamples.push(rawAng());if(now-calibStart>1100&&(calibSamples.length>5||now-calibStart>4000))finishCalib()}
- if(state==='play'&&innerWidth<=innerHeight){
- const tgt=(useDrag?dragAng:wrap(rawAng()-base))*dir;if(Math.abs(tgt-sm)>dead)sm+=(tgt-sm)*(useDrag?.35:alpha);
- theta=Math.max(-40,Math.min(150,sm*gain));acc+=dt;while(acc>=step){simulate();acc-=step}
- }
- if(ng){ng.gain.setTargetAtTime(state==='play'?Math.min(.18,flow*.005):0,actx.currentTime,.06);filt.frequency.value=400+1000*(counts[0]+counts[1])/capacity}
- if(state==='play'||state==='ready')draw();requestAnimationFrame(loop)
+// Capsule walls have two physical faces and round lips. Sweep in wall-local
+// coordinates so a moving wall cannot cross a particle between fixed steps.
+function collideOutline(i, polygon, k, adhesion) {
+  const rotating = k >= 0, c = rotating ? cosines[k] : 1, s = rotating ? sines[k] : 0;
+  const px = rotating ? pivot(k) : 0, py = rotating ? 160 : 0;
+  let lx = (x[i] - px) * c + (y[i] - py) * s;
+  let ly = -(x[i] - px) * s + (y[i] - py) * c;
+  if (rotating && (lx < -57 || lx > 57 || ly < -13 || ly > 168)) return;
+  const pc = rotating ? previousCosines[k] : 1, ps = rotating ? previousSines[k] : 0;
+  const ox = (oldX[i] - px) * pc + (oldY[i] - py) * ps;
+  const oy = -(oldX[i] - px) * ps + (oldY[i] - py) * pc;
+  for (let segment = 1; segment < polygon.length; segment++) {
+    const a = polygon[segment - 1], b = polygon[segment];
+    const dx = b[0] - a[0], dy = b[1] - a[1], length2 = dx * dx + dy * dy;
+    const along = ((lx - a[0]) * dx + (ly - a[1]) * dy) / length2;
+    const t = clamp(along, 0, 1), qx = a[0] + t * dx, qy = a[1] + t * dy;
+    let nx = lx - qx, ny = ly - qy, distance = Math.hypot(nx, ny);
+    const oldSide = (ox - a[0]) * dy - (oy - a[1]) * dx;
+    const side = (lx - a[0]) * dy - (ly - a[1]) * dx;
+    const oldAlong = ((ox - a[0]) * dx + (oy - a[1]) * dy) / length2;
+    const crosses = oldSide * side < 0 && along > 0 && along < 1 && oldAlong > 0 && oldAlong < 1;
+    if (distance > contactDistance + 6 && !crosses) continue;
+    if (crosses || distance < .0001) {
+      const sign = oldSide >= 0 ? 1 : -1, length = Math.sqrt(length2);
+      nx = dy / length * sign; ny = -dx / length * sign;
+      distance = (lx - qx) * nx + (ly - qy) * ny;
+    } else { nx /= distance; ny /= distance; }
+    const normalX = nx * c - ny * s, normalY = nx * s + ny * c;
+    const worldQX = qx * c - qy * s, worldQY = qx * s + qy * c;
+    const wallSpeedX = rotating ? -angularSpeed[k] * worldQY : 0;
+    const wallSpeedY = rotating ? angularSpeed[k] * worldQX : 0;
+    if (distance < contactDistance) {
+      lx += nx * (contactDistance - distance); ly += ny * (contactDistance - distance);
+      contactX[i] = normalX; contactY[i] = normalY;
+      wallVX[i] = wallSpeedX; wallVY[i] = wallSpeedY;
+    }
+    if (adhesion && distance >= contactDistance - 1) {
+      const relativeSpeed = Math.hypot(vx[i] - wallSpeedX, vy[i] - wallSpeedY);
+      const slow = 1 / (1 + Math.pow(relativeSpeed / 115, 4));
+      const reach = clamp(1 - Math.max(0, distance - contactDistance) / 6, 0, 1);
+      // The exterior neck is wettable. At high Weber number the attraction
+      // loses against inertia and a fast jet detaches from the lip.
+      const exteriorNeck = rotating && side < 0 && qy < 32;
+      const strength = exteriorNeck ? 1600 : 180;
+      vx[i] -= normalX * strength * slow * reach * dt;
+      vy[i] -= normalY * strength * slow * reach * dt;
+      const tangent = (vx[i] - wallSpeedX) * -normalY + (vy[i] - wallSpeedY) * normalX;
+      const friction = (kind[i] ? 9 : 3) * slow * reach * dt;
+      vx[i] += normalY * tangent * friction; vy[i] -= normalX * tangent * friction;
+      wetness[i] = Math.max(wetness[i], exteriorNeck ? slow * reach : 0);
+    }
+  }
+  x[i] = px + lx * c - ly * s; y[i] = py + lx * s + ly * c;
 }
-intro();requestAnimationFrame(loop);
+function collideAll(adhesion) {
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    for (let k = 0; k < level; k++) collideOutline(i, outline, k, adhesion);
+    collideOutline(i, cupOutline, -1, adhesion);
+  }
+}
+function applyCohesion() {
+  buildNeighbors(); deltaX.fill(0); deltaY.fill(0);
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    const start = i * neighborStride;
+    for (let n = 0; n < neighborCount[i]; n++) {
+      const j = neighbors[start + n]; if (j <= i) continue;
+      const dx = x[j] - x[i], dy = y[j] - y[i], distance = Math.hypot(dx, dy);
+      if (distance < .01) continue;
+      const q = 1 - distance / h, samePhase = kind[i] === kind[j];
+      // Finite-range surface tension, equal/opposite pair forces. The
+      // unlike-phase repulsion supplies an immiscible water/oil interface.
+      const attraction = samePhase ? (kind[i] ? 300 : 750) * q * Math.max(0, distance / spacing - .8) : -60 * q * q;
+      let fx = attraction * dx / distance, fy = attraction * dy / distance;
+      if (!samePhase) {
+        // Restore an inverted density interface (rho_oil / rho_water = .78).
+        // Equal/opposite buoyancy forces vanish once the lighter phase is above,
+        // avoiding an artificial compressive load on an already settled layer.
+        const inversion = clamp((kind[i] ? -dy : dy) / spacing, 0, 1);
+        fy += (kind[i] ? -1 : 1) * 320 * q * inversion;
+      }
+      deltaX[i] += fx / (kind[i] ? .78 : 1); deltaY[i] += fy / (kind[i] ? .78 : 1);
+      deltaX[j] -= fx / (kind[j] ? .78 : 1); deltaY[j] -= fy / (kind[j] ? .78 : 1);
+    }
+  }
+  for (let i = 0; i < total; i++) if (alive[i]) { vx[i] += deltaX[i] * dt; vy[i] += deltaY[i] * dt; }
+}
+function applyViscosity() {
+  deltaX.fill(0); deltaY.fill(0);
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    const start = i * neighborStride;
+    for (let n = 0; n < neighborCount[i]; n++) {
+      const j = neighbors[start + n]; if (j <= i) continue;
+      const dx = x[j] - x[i], dy = y[j] - y[i];
+      const q = Math.max(0, 1 - (dx * dx + dy * dy) / h2);
+      const viscosity = kind[i] && kind[j] ? .13 : .025;
+      const weight = viscosity * q * q * q * inverseRestDensity;
+      const fx = (vx[j] - vx[i]) * weight, fy = (vy[j] - vy[i]) * weight;
+      deltaX[i] += fx / (kind[i] ? .78 : 1); deltaY[i] += fy / (kind[i] ? .78 : 1);
+      deltaX[j] -= fx / (kind[j] ? .78 : 1); deltaY[j] -= fy / (kind[j] ? .78 : 1);
+    }
+  }
+  for (let i = 0; i < total; i++) if (alive[i]) { vx[i] += deltaX[i]; vy[i] += deltaY[i]; }
+}
+// Subgrid terminal-rise transport for an immiscible mixture. A coarse 2D
+// particle lattice can pin a one-particle oil film below water indefinitely.
+// Advect equal phase volumes between adjacent, slow-moving cup samples every
+// 0.2 s. This preserves both phase volumes and pair momentum, while the PBF
+// positions and resolved splashes continue to follow the common velocity field.
+function transportPhases() {
+  if (level !== 2 || ++phaseSteps % 24) return;
+  phaseMoved.fill(0);
+  for (let i = 0; i < total; i++) if (alive[i] && kind[i] && !lost[i] && !phaseMoved[i] &&
+      x[i] > cup.left + contactDistance && x[i] < cup.right - contactDistance &&
+      y[i] > cup.top + h && y[i] < cup.bottom && Math.hypot(vx[i], vy[i]) < 40) {
+    let above = -1, rise = spacing * .3;
+    const start = i * neighborStride;
+    for (let n = 0; n < neighborCount[i]; n++) {
+      const j = neighbors[start + n], dx = x[j] - x[i], dy = y[i] - y[j];
+      if (kind[j] || lost[j] || phaseMoved[j] || dy <= rise || dx * dx + dy * dy > spacing * spacing * 2.25 ||
+          Math.hypot(vx[j] - vx[i], vy[j] - vy[i]) > 35 ||
+          x[j] <= cup.left + contactDistance || x[j] >= cup.right - contactDistance || y[j] < cup.top + h) continue;
+      above = j; rise = dy;
+    }
+    if (above < 0) continue;
+    const correctionX = .22 * (vx[above] - vx[i]) / 1.78;
+    const correctionY = .22 * (vy[above] - vy[i]) / 1.78;
+    kind[i] = 0; kind[above] = 1; phaseMoved[i] = phaseMoved[above] = 1;
+    vx[i] += correctionX; vx[above] += correctionX;
+    vy[i] += correctionY; vy[above] += correctionY;
+  }
+}
+function simulate(forceX, forceY) {
+  simulationTime += dt; flow *= Math.exp(-dt / .2);
+  for (let k = 0; k < level; k++) {
+    previousAngles[k] = angles[k]; previousCosines[k] = Math.cos(angles[k]); previousSines[k] = Math.sin(angles[k]);
+    const desired = k === active ? theta * Math.PI / 180 : 0;
+    angles[k] += clamp(desired - angles[k], -5 * dt, 5 * dt);
+    angularSpeed[k] = (angles[k] - previousAngles[k]) / dt;
+    cosines[k] = Math.cos(angles[k]); sines[k] = Math.sin(angles[k]);
+  }
+  applyCohesion();
+  contactX.fill(0); contactY.fill(0); wetness.fill(0);
+  for (let i = 0; i < total; i++) if (alive[i]) { oldX[i] = x[i]; oldY[i] = y[i]; }
+  collideAll(true);
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    vx[i] = clamp(vx[i] - forceX * dt, -950, 950);
+    vy[i] = clamp(vy[i] + (650 - forceY) * dt, -950, 950);
+    x[i] += vx[i] * dt; y[i] += vy[i] * dt;
+  }
+  collideAll(false);
+  for (let iteration = 0; iteration < iterations; iteration++) { solveDensity(); collideAll(false); }
+  for (let i = 0; i < total; i++) if (alive[i]) {
+    vx[i] = (x[i] - oldX[i]) / dt; vy[i] = (y[i] - oldY[i]) / dt;
+    const nx = contactX[i], ny = contactY[i];
+    if (nx || ny) {
+      const relativeX = vx[i] - wallVX[i], relativeY = vy[i] - wallVY[i];
+      const inward = Math.min(0, relativeX * nx + relativeY * ny);
+      vx[i] -= inward * nx; vy[i] -= inward * ny;
+      const tangent = relativeX * -ny + relativeY * nx, friction = kind[i] ? .045 : .012;
+      vx[i] += ny * tangent * friction; vy[i] -= nx * tangent * friction;
+    }
+    vx[i] = clamp(vx[i] * .9995, -950, 950); vy[i] = clamp(vy[i] * .9995, -950, 950);
+    const k = kind[i], localY = -(x[i] - pivot(k)) * sines[k] + (y[i] - 160) * cosines[k];
+    if (!departed[i] && localY < -2) {
+      departed[i] = 1; emitted++; flow += 5;
+      if (k === 1 && !oilStarted) { oilStarted = true; waterFirst = counts[0] / capacity >= .19; }
+    }
+    // Count irrecoverable liquid once, including particles that later leave
+    // the render bounds. Particles still flying above the cup can return.
+    const outsideCup = x[i] < cup.left || x[i] > cup.right;
+    if (!lost[i] && ((outsideCup && y[i] > cup.bottom - contactDistance) || y[i] > 535 || x[i] < -120 || x[i] > 510 || y[i] < -170)) {
+      lost[i] = 1; spilled++;
+    }
+    if (y[i] > 555 || x[i] < -145 || x[i] > 535 || y[i] < -195) alive[i] = 0;
+  }
+  applyViscosity(); transportPhases(); updateCounts();
+}
+
+// Additive compact kernels on a half-resolution field give an actual
+// metaball isosurface. Narrow jets overlap naturally, without joining drops
+// that have physically separated. Sample the field gradient for highlights.
+const layer = document.createElement('canvas'); layer.width = 195; layer.height = 260;
+const ink = layer.getContext('2d');
+const field = new Float32Array(195 * 260), pixels = ink.createImageData(195, 260);
+const renderRadius = 4.2, renderRadius2 = renderRadius * renderRadius;
+function drawLiquid(k) {
+  field.fill(0); const data = pixels.data; data.fill(0);
+  for (let i = 0; i < total; i++) if (alive[i] && kind[i] === k) {
+    const px = x[i] * .5, py = y[i] * .5;
+    const left = Math.max(0, Math.floor(px - renderRadius)), right = Math.min(194, Math.ceil(px + renderRadius));
+    const top = Math.max(0, Math.floor(py - renderRadius)), bottom = Math.min(259, Math.ceil(py + renderRadius));
+    for (let row = top; row <= bottom; row++) for (let col = left; col <= right; col++) {
+      const dx = col + .5 - px, dy = row + .5 - py;
+      const q = Math.max(0, 1 - (dx * dx + dy * dy) / renderRadius2);
+      field[row * 195 + col] += q * q * q;
+    }
+  }
+  for (let row = 1; row < 259; row++) for (let col = 1; col < 194; col++) {
+    const index = row * 195 + col, value = field[index]; if (value < .38) continue;
+    const edge = clamp((value - .38) / .2, 0, 1);
+    const surface = clamp((1.15 - value) / .45, 0, 1);
+    const highlight = surface * clamp((field[index + 195] - field[index - 195]) * .8 + (field[index + 1] - field[index - 1]) * .2, 0, 1);
+    const p = index * 4;
+    data[p] = (k ? 231 : 66) + highlight * (k ? 24 : 165);
+    data[p + 1] = (k ? 170 : 164) + highlight * (k ? 73 : 77);
+    data[p + 2] = (k ? 55 : 223) + highlight * (k ? 140 : 30);
+    data[p + 3] = edge * 233;
+  }
+  ink.putImageData(pixels, 0, 0); ctx.drawImage(layer, 0, 0, 390, 520);
+}
+function hudText() {
+  return '水 ' + Math.round(counts[0] / capacity * 100) + '%' +
+    (level === 2 ? '　油 ' + Math.round(counts[1] / capacity * 100) + '%' : '') +
+    '　溅出 ' + (spillFraction() * 100).toFixed(1) + '%';
+}
+function draw() {
+  const scale = screenScale(), dpr = Math.min(devicePixelRatio, 2);
+  if (canvas.width !== Math.round(innerWidth * dpr) || canvas.height !== Math.round(innerHeight * dpr)) {
+    canvas.width = Math.round(innerWidth * dpr); canvas.height = Math.round(innerHeight * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, innerWidth, innerHeight);
+  ctx.save(); ctx.translate((innerWidth - 390 * scale) / 2, (innerHeight - 520 * scale) / 2); ctx.scale(scale, scale);
+  for (let k = 0; k < level; k++) drawLiquid(k);
+  ctx.lineWidth = wallHalfWidth * 2; ctx.lineJoin = ctx.lineCap = 'round';
+  for (let k = 0; k < level; k++) {
+    ctx.save(); ctx.translate(pivot(k), 160); ctx.rotate(angles[k]);
+    ctx.strokeStyle = palette[k]; ctx.globalAlpha = .65; ctx.beginPath();
+    outline.forEach(([px, py], i) => i ? ctx.lineTo(px, py) : ctx.moveTo(px, py)); ctx.stroke(); ctx.restore();
+  }
+  ctx.strokeStyle = '#b4cbd8'; ctx.beginPath();
+  cupOutline.forEach(([px, py], i) => i ? ctx.lineTo(px, py) : ctx.moveTo(px, py)); ctx.stroke();
+  ctx.lineWidth = 1;
+  for (const [fraction, label] of (level === 1 ? [[.32, '水 32%']] : [[.25, '水 25%'], [.45, '总量 45%']])) {
+    const lineY = cup.bottom - contactDistance - (cup.bottom - cup.top - contactDistance) * fraction;
+    ctx.fillStyle = ctx.strokeStyle = '#e4edf4'; ctx.setLineDash([3, 5]); ctx.beginPath();
+    ctx.moveTo(76, lineY); ctx.lineTo(320, lineY); ctx.stroke(); ctx.font = '11px sans-serif'; ctx.fillText(label, 12, lineY + 4);
+  }
+  ctx.restore(); ctx.fillStyle = '#9caab9'; ctx.font = '10px sans-serif';
+  ctx.fillText('倾斜 ' + theta.toFixed(0) + '° · 抖动 ' + sigma.toFixed(2) + '° · ' +
+    (useDrag ? '手指' : '传感器') + ' · ' + fps.toFixed(0) + ' FPS · 子步 ' + substepBudget, 12, innerHeight - 61);
+  ctx.fillText('传感器 ' + (window.DeviceMotionEvent ? '支持' : '无') + ' · 安全连接 ' +
+    (isSecureContext ? '是' : '否') + ' · 权限 ' + permission +
+    (/MicroMessenger/i.test(navigator.userAgent) ? ' · 微信' : ''), 12, innerHeight - 46);
+  $('info').textContent = hudText();
+}
+function loop(now) {
+  const elapsed = Math.min(.1, (now - previousTime) / 1000); previousTime = now;
+  fps += (1 / Math.max(.001, elapsed) - fps) * .035;
+  const start = performance.now();
+  if (state === 'calib') {
+    if (haveMotion || haveOrientation) calibration.push(rawAngle());
+    if (now - calibrationStart > 1100 && (calibration.length > 5 || now - calibrationStart > 4000)) finishCalibration();
+  }
+  if (state === 'play' && innerWidth <= innerHeight && !document.hidden) {
+    const desired = (useDrag ? dragAngle : wrap(rawAngle() - base)) * direction;
+    if (Math.abs(desired - sm) > dead) sm += (desired - sm) * (1 - Math.pow(1 - (useDrag ? .35 : alpha), elapsed * 60));
+    theta = clamp(sm * gain, -60, 160);
+    if (now - motionTime > 150) { accelerationX *= Math.exp(-elapsed * 12); accelerationY *= Math.exp(-elapsed * 12); }
+    if (now - dragTime > 35) { dragForceX *= Math.exp(-elapsed * 14); dragForceY *= Math.exp(-elapsed * 14); }
+    const forceX = clamp((useDrag ? dragForceX : accelerationX) * 100, -1800, 1800);
+    const forceY = clamp((useDrag ? dragForceY : accelerationY) * 100, -1800, 1800);
+    accumulator = Math.min(accumulator + elapsed, (substepBudget + 1) * dt);
+    let steps = 0;
+    while (accumulator >= dt - 1e-7 && steps < substepBudget) { simulate(forceX, forceY); accumulator -= dt; steps++; }
+    if (accumulator >= dt) accumulator %= dt;
+  } else accumulator = 0;
+  if (noiseGain) {
+    noiseGain.gain.setTargetAtTime(state === 'play' && !document.hidden ? Math.min(.2, flow * .001) : 0, audio.currentTime, .06);
+    filter.frequency.setTargetAtTime(400 + 1200 * (counts[0] + counts[1]) / capacity, audio.currentTime, .1);
+  }
+  if (state === 'play' || state === 'ready') draw();
+  frameCost += (performance.now() - start - frameCost) * .05;
+  if (state === 'play') {
+    if (frameCost > 14 || elapsed > .023) { slowFrames++; fastFrames = 0; }
+    else { slowFrames = Math.max(0, slowFrames - 1); if (frameCost < 7 && elapsed < .019) fastFrames++; }
+    // Keep dt fixed under load, drop backlog rather than destabilizing the solver.
+    if (slowFrames > 45) { substepBudget = 1; slowFrames = 0; }
+    if (fastFrames > 180) { substepBudget = 2; fastFrames = 0; }
+  }
+  requestAnimationFrame(loop);
+}
+show('<h2>液体实验室</h2><p>锁定竖屏，向右倾斜手机倒液。</p><p>对准刻度后回正，点验收。</p>' +
+  '<p class="small">慢倒会挂壁，猛晃会洒出 · 溅出须 ≤10%</p><button id="go">开始</button><button class="ghost" id="drag">手指模式</button>');
+$('go').onclick = async () => {
+  initAudio();
+  const requests = enableSensors();
+  screen.orientation?.lock?.('portrait').catch(() => {});
+  show('<h2>正在打开传感器</h2><p>如果弹窗，请点允许</p>');
+  await requests; startCalibration();
+};
+$('drag').onclick = () => { useDrag = true; initAudio(); newCup(); };
+document.addEventListener('visibilitychange', () => { accumulator = 0; previousTime = performance.now(); });
+requestAnimationFrame(loop);
 })();
-</script></body></html>
+</script>
+</body>
+</html>
