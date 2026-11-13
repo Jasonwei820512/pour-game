@@ -69,11 +69,12 @@ const wrap=a=>{while(a>180)a-=360;while(a<=-180)a+=360;return a;};
 /* ---------- 传感器 ---------- */
 function onMotion(e){const g=e.accelerationIncludingGravity;if(!g||g.x==null)return;if(Math.hypot(g.x,g.y)<2)return;motionAng=-Math.atan2(g.x,g.y)*180/Math.PI;haveMotion=true;}
 function onOri(e){if(e.gamma==null)return;oriAng=e.gamma;haveOri=true;}
+function diag(){return '浏览器支持:'+(window.DeviceOrientationEvent?'是':'否')+' 安全连接:'+(window.isSecureContext?'是':'否')+' 权限:'+(window.__perm||'未弹窗')+(/MicroMessenger/i.test(navigator.userAgent)?' (在微信里)':'');}
 function rawAng(){return haveMotion?motionAng:oriAng;}
 function enableSensors(){
   const asks=[];
   try{if(window.DeviceMotionEvent&&DeviceMotionEvent.requestPermission)asks.push(DeviceMotionEvent.requestPermission().catch(()=>{}));}catch(e){}
-  try{if(window.DeviceOrientationEvent&&DeviceOrientationEvent.requestPermission)asks.push(DeviceOrientationEvent.requestPermission().catch(()=>{}));}catch(e){}
+  try{if(window.DeviceOrientationEvent&&DeviceOrientationEvent.requestPermission)asks.push(DeviceOrientationEvent.requestPermission().then(r=>{window.__perm=r;}).catch(e=>{window.__perm='出错';}));}catch(e){window.__perm='出错';}
   addEventListener('devicemotion',onMotion);addEventListener('deviceorientation',onOri);
   return Promise.all(asks);
 }
@@ -110,7 +111,7 @@ function intro(){
   <p>3. 把杯子倒到<b>亮色区域</b>里,停手等结果</p>
   <p class="small">倒得越慢越好控制;快满时声音会变尖</p>
   <button id="go">开始</button>`);
-  $('go').onclick=()=>{enableSensors().then(()=>{});initAudio();startCalib();};
+  $('go').onclick=()=>{const p=enableSensors();initAudio();show('<h2>正在打开传感器</h2><p class="small">如果弹窗,请点“允许”</p>');p.then(startCalib);};
 }
 function startCalib(){
   show(`<h2>请拿稳手机</h2><p>正常竖着拿,别动,大约 1 秒</p><p class="small">在测这台手机的零点和抖动</p>`);
@@ -136,7 +137,7 @@ function newCup(first){
   if(level>4)tol=0.03;
   $('lv').textContent=`第 ${level} 杯`;
   state='ready';
-  show(useDrag?`<h2>没读到陀螺仪</h2><p>这个页面里拿不到传感器,先用<b>手指左右拖动</b>代替倾斜,看看画面和流水手感</p><button id="ok">知道了</button>`
+  show(useDrag?`<h2>没读到陀螺仪</h2><p>这个页面里拿不到传感器,先用<b>手指左右拖动</b>代替倾斜,看看画面和流水手感</p><p class="small">${diag()}</p><button id="ok">知道了</button>`
     :`<h2>第 ${level} 杯</h2><p>目标 ${Math.round(target*100)}%(误差 ±${Math.round(tol*100)}%)</p><p class="small">把手机摆正就开始</p><button id="ok">好</button>`);
   $('ok').onclick=()=>{hide();if(useDrag)dragAng=0;};
 }
@@ -160,9 +161,10 @@ function loop(now){
   // 角度
   if(state==='calib'){
     if(haveMotion||haveOri)calibSamples.push(rawAng());
-    if(now-calibStart>1100)finishCalib();
+    if(now-calibStart>1100&&(calibSamples.length>5||now-calibStart>4000))finishCalib();
   }
   let tgt;
+  if(useDrag&&(haveMotion||haveOri)&&state!=='calib'){useDrag=false;base=rawAng();sm=0;}
   if(useDrag)tgt=dragAng;
   else{const rel=wrap(rawAng()-base)*dir;tgt=rel;}
   if(Math.abs(tgt-sm)>dead)sm+=(tgt-sm)*(useDrag?0.35:alpha);
