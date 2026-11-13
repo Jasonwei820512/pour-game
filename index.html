@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>倒水手感小样</title>
+<style>
+html,body{margin:0;height:100%;background:#1b2130;color:#eef1f7;font-family:-apple-system,"PingFang SC","Hiragino Sans GB","Noto Sans SC",sans-serif;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:fixed;top:0;left:0;right:0;padding:14px 18px;display:flex;justify-content:space-between;font-size:15px;pointer-events:none}
+#overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(14,17,25,.9)}
+#overlay.hide{display:none}
+.card{max-width:320px;padding:24px;text-align:center;line-height:1.7;font-size:15px}
+.card h2{margin:0 0 8px;font-size:22px}
+.card p{margin:6px 0}
+.small{opacity:.7;font-size:13px}
+button{font:inherit;font-size:17px;padding:11px 26px;border:0;border-radius:24px;background:#f2a541;color:#1b2130;margin:10px 4px 0;font-weight:600}
+button.ghost{background:transparent;color:#eef1f7;border:1px solid rgba(255,255,255,.4)}
+#bar{position:fixed;left:14px;right:14px;bottom:12px;font-size:13px;display:flex;gap:8px;align-items:center;opacity:.85}
+#bar input{flex:1}
+#bar button{font-size:13px;padding:5px 12px;margin:0}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><span id="lv">第 1 杯</span><span id="info"></span></div>
+<div id="bar">灵敏度<input id="gain" type="range" min="0.8" max="2.5" step="0.1" value="1.4"><span id="gv">1.4</span><button class="ghost" id="inv">方向反了</button></div>
+<div id="overlay"><div class="card" id="card"></div></div>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const cv=$('c'),ctx=cv.getContext('2d');
+let W,H,s,B,G,A0;
+const CAP=0.72/0.95;            // 满瓶倒完能装到杯子的 95%
+let state='intro';              // intro | calib | ready | play | result
+let level=1,target=0.5,tol=0.08;
+let vb=0.72,poured=0,spilled=0,parts=[],lastFlow=0,flowFrac=0;
+let theta=0,sm=0,alpha=0.2,sigma=0,dead=0.4;
+let gain=1.4,dir=1;
+let haveMotion=false,haveOri=false,motionAng=0,oriAng=0,base=0,useDrag=false,dragAng=0;
+let calibSamples=[],calibStart=0;
+
+function resize(){
+  const dpr=window.devicePixelRatio||1;W=innerWidth;H=innerHeight;
+  cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);
+  s=Math.min(W,H*0.55);
+  B={cx:W*0.34,cy:H*0.33,bw:s*0.26,bh:s*0.42,nw:s*0.09,nh:s*0.12};
+  G={cx:W*0.68,top:H*0.60,w:Math.min(W*0.4,s*0.42),h:s*0.42};
+  if(G.top+G.h>H-70)G.top=H-70-G.h;
+  A0=area(localPoly());
+}
+addEventListener('resize',resize);resize();
+
+function localPoly(){
+  const {bw,bh,nw,nh}=B;
+  return [[-bw/2,bh/2],[bw/2,bh/2],[bw/2,-bh/2],[nw/2,-bh/2-nh*0.4],[nw/2,-bh/2-nh],[-nw/2,-bh/2-nh],[-nw/2,-bh/2-nh*0.4],[-bw/2,-bh/2]];
+}
+function toWorld(p,t){const c=Math.cos(t),sn=Math.sin(t);return [B.cx+p[0]*c-p[1]*sn,B.cy+p[0]*sn+p[1]*c];}
+function area(p){let a=0;for(let i=0;i<p.length;i++){const q=p[i],r=p[(i+1)%p.length];a+=q[0]*r[1]-r[0]*q[1];}return Math.abs(a)/2;}
+function clipBelow(p,L){const o=[];for(let i=0;i<p.length;i++){const a=p[i],b=p[(i+1)%p.length],ai=a[1]>=L,bi=b[1]>=L;if(ai)o.push(a);if(ai!==bi){const t=(L-a[1])/(b[1]-a[1]);o.push([a[0]+t*(b[0]-a[0]),L]);}}return o;}
+function levelY(wp,V){
+  let lo=Infinity,hi=-Infinity;for(const q of wp){lo=Math.min(lo,q[1]);hi=Math.max(hi,q[1]);}
+  if(V<=0)return hi;
+  for(let i=0;i<30;i++){const m=(lo+hi)/2;if(area(clipBelow(wp,m))>V)lo=m;else hi=m;}
+  return (lo+hi)/2;
+}
+const wrap=a=>{while(a>180)a-=360;while(a<=-180)a+=360;return a;};
+
+/* ---------- 传感器 ---------- */
+function onMotion(e){const g=e.accelerationIncludingGravity;if(!g||g.x==null)return;if(Math.hypot(g.x,g.y)<2)return;motionAng=-Math.atan2(g.x,g.y)*180/Math.PI;haveMotion=true;}
+function onOri(e){if(e.gamma==null)return;oriAng=e.gamma;haveOri=true;}
+function rawAng(){return haveMotion?motionAng:oriAng;}
+function enableSensors(){
+  const asks=[];
+  try{if(window.DeviceMotionEvent&&DeviceMotionEvent.requestPermission)asks.push(DeviceMotionEvent.requestPermission().catch(()=>{}));}catch(e){}
+  try{if(window.DeviceOrientationEvent&&DeviceOrientationEvent.requestPermission)asks.push(DeviceOrientationEvent.requestPermission().catch(()=>{}));}catch(e){}
+  addEventListener('devicemotion',onMotion);addEventListener('deviceorientation',onOri);
+  return Promise.all(asks);
+}
+
+/* ---------- 手指拖动(没有传感器时) ---------- */
+let lastX=null;
+cv.addEventListener('pointerdown',e=>{lastX=e.clientX;});
+cv.addEventListener('pointermove',e=>{if(lastX==null||!useDrag)return;dragAng=Math.max(-40,Math.min(150,dragAng+(e.clientX-lastX)*0.6));lastX=e.clientX;});
+addEventListener('pointerup',()=>{lastX=null;});
+
+$('gain').oninput=e=>{gain=+e.target.value;$('gv').textContent=gain.toFixed(1);};
+$('inv').onclick=()=>{dir=-dir;};
+
+/* ---------- 声音:倒水声,越满音调越高 ---------- */
+let actx,ng,filt;
+function initAudio(){
+  try{actx=new (window.AudioContext||window.webkitAudioContext)();
+    const len=actx.sampleRate*2,buf=actx.createBuffer(1,len,actx.sampleRate),d=buf.getChannelData(0);
+    for(let i=0;i<len;i++)d[i]=Math.random()*2-1;
+    const src=actx.createBufferSource();src.buffer=buf;src.loop=true;
+    filt=actx.createBiquadFilter();filt.type='bandpass';filt.Q.value=5;filt.frequency.value=400;
+    ng=actx.createGain();ng.gain.value=0;src.connect(filt);filt.connect(ng);ng.connect(actx.destination);src.start();
+  }catch(e){actx=null;}
+}
+function ding(ok){if(!actx)return;try{const o=actx.createOscillator(),g=actx.createGain();o.frequency.value=ok?880:220;o.type=ok?'sine':'triangle';g.gain.setValueAtTime(0.25,actx.currentTime);g.gain.exponentialRampToValueAtTime(0.001,actx.currentTime+0.5);o.connect(g);g.connect(actx.destination);o.start();o.stop(actx.currentTime+0.5);}catch(e){}}
+
+/* ---------- 流程 ---------- */
+function show(html){$('card').innerHTML=html;$('overlay').classList.remove('hide');}
+function hide(){$('overlay').classList.add('hide');}
+function intro(){
+  show(`<h2>倒水手感小样</h2>
+  <p>1. 先把手机<b>锁定竖屏</b>(不然一歪屏幕就转了)</p>
+  <p>2. 手机向右倾斜,瓶子就会倒水</p>
+  <p>3. 把杯子倒到<b>亮色区域</b>里,停手等结果</p>
+  <p class="small">倒得越慢越好控制;快满时声音会变尖</p>
+  <button id="go">开始</button>`);
+  $('go').onclick=()=>{enableSensors().then(()=>{});initAudio();startCalib();};
+}
+function startCalib(){
+  show(`<h2>请拿稳手机</h2><p>正常竖着拿,别动,大约 1 秒</p><p class="small">在测这台手机的零点和抖动</p>`);
+  state='calib';calibSamples=[];calibStart=performance.now();
+}
+function finishCalib(){
+  if(!haveMotion&&!haveOri){useDrag=true;base=0;sigma=0;alpha=0.3;}
+  else{
+    let sx=0,sy=0;for(const a of calibSamples){sx+=Math.cos(a*Math.PI/180);sy+=Math.sin(a*Math.PI/180);}
+    base=Math.atan2(sy,sx)*180/Math.PI;
+    let v=0;for(const a of calibSamples){const d=wrap(a-base);v+=d*d;}
+    sigma=calibSamples.length?Math.sqrt(v/calibSamples.length):0;
+    alpha=Math.max(0.06,Math.min(0.3,0.3/(1+sigma*2)));   // 抖得越厉害,平滑越重
+    dead=Math.min(1.5,0.3+sigma);
+  }
+  sm=0;newCup(true);
+}
+function newCup(first){
+  vb=0.72;poured=0;spilled=0;parts=[];flowFrac=0;
+  if(!first){}
+  target=Math.round((0.3+Math.random()*0.4)*20)/20;
+  tol=[0.08,0.06,0.045,0.035][Math.min(level-1,3)]||0.03;
+  if(level>4)tol=0.03;
+  $('lv').textContent=`第 ${level} 杯`;
+  state='ready';
+  show(useDrag?`<h2>没读到陀螺仪</h2><p>这个页面里拿不到传感器,先用<b>手指左右拖动</b>代替倾斜,看看画面和流水手感</p><button id="ok">知道了</button>`
+    :`<h2>第 ${level} 杯</h2><p>目标 ${Math.round(target*100)}%(误差 ±${Math.round(tol*100)}%)</p><p class="small">把手机摆正就开始</p><button id="ok">好</button>`);
+  $('ok').onclick=()=>{hide();if(useDrag)dragAng=0;};
+}
+function finish(reason){
+  if(state!=='play')return;state='result';
+  const f=poured/CAP,err=f-target,okk=Math.abs(err)<=tol&&reason!=='over';
+  ding(okk);
+  let t;
+  if(okk)t=Math.abs(err)<=tol/3?'完美!':'过关!';
+  else t=reason==='over'||err>0?'倒多了':'倒少了';
+  show(`<h2>${t}</h2><p>目标 ${Math.round(target*100)}%,你倒了 ${(f*100).toFixed(1)}%</p>${spilled>0.005?`<p class="small">洒出去 ${(spilled/CAP*100).toFixed(1)}%</p>`:''}
+  <button id="again" class="ghost">再来这杯</button><button id="next">${okk?'下一杯':'换一杯'}</button>`);
+  $('again').onclick=()=>{newCup();};
+  $('next').onclick=()=>{if(okk)level++;newCup();};
+}
+
+/* ---------- 主循环 ---------- */
+let lastT=performance.now();
+function loop(now){
+  const dt=Math.min(0.033,(now-lastT)/1000);lastT=now;
+  // 角度
+  if(state==='calib'){
+    if(haveMotion||haveOri)calibSamples.push(rawAng());
+    if(now-calibStart>1100)finishCalib();
+  }
+  let tgt;
+  if(useDrag)tgt=dragAng;
+  else{const rel=wrap(rawAng()-base)*dir;tgt=rel;}
+  if(Math.abs(tgt-sm)>dead)sm+=(tgt-sm)*(useDrag?0.35:alpha);
+  theta=useDrag?sm:Math.max(-40,Math.min(150,sm*gain));
+  if(state==='ready'&&$('overlay').classList.contains('hide')&&theta<15)state='play';
+
+  const t=theta*Math.PI/180,wp=localPoly().map(p=>toWorld(p,t));
+  const L=levelY(wp,vb*A0);
+  const mouthL=[0,-B.bh/2-B.nh],mouth=toWorld(mouthL,t);
+  const f=poured/CAP;
+  // 出水:液面高过瓶口才流,流速 ∝ √落差
+  flowFrac=0;
+  if((state==='play')&&vb>0&&L<mouth[1]-0.5){
+    const head=mouth[1]-L,K=240*Math.pow(s/390,1.5);
+    flowFrac=K*Math.sqrt(head)/A0;
+    const amt=Math.min(vb,flowFrac*dt);vb-=amt;lastFlow=now;
+    const n=Math.max(1,Math.min(6,Math.ceil(amt*A0/20)));
+    const dx=Math.sin(t),dy=-Math.cos(t),sp=40+Math.sqrt(head)*10;
+    for(let i=0;i<n;i++){const j=(Math.random()-0.5)*B.nw*0.6;parts.push({x:mouth[0]+Math.cos(t)*j,y:mouth[1]+Math.sin(t)*j,vx:dx*sp+(Math.random()-0.5)*10,vy:dy*sp,a:amt/n,chk:false,inn:false});}
+  }
+  // 水滴
+  const gl=G.cx-G.w/2,gr=G.cx+G.w/2,surf=G.top+G.h*(1-Math.min(1,f));
+  for(let i=parts.length-1;i>=0;i--){
+    const p=parts[i];p.vy+=1400*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;
+    if(!p.chk&&p.y>=G.top){p.chk=true;p.inn=p.x>gl+3&&p.x<gr-3;}
+    if(p.inn&&p.y>=surf){poured+=p.a;parts.splice(i,1);continue;}
+    if(p.y>H+20){spilled+=p.a;parts.splice(i,1);}
+  }
+  const f2=poured/CAP;
+  if(state==='play'){
+    if(f2>target+tol||f2>=1)finish('over');
+    else if(poured>0&&now-lastFlow>1600&&parts.length===0)finish('stop');
+    else if(vb<=0.0005&&parts.length===0)finish('empty');
+  }
+  // 声音
+  if(ng){const on=(state==='play'||state==='result')&&parts.length>0;
+    ng.gain.setTargetAtTime(on?Math.min(0.35,0.08+flowFrac*1.5):0,actx.currentTime,0.05);
+    filt.frequency.setTargetAtTime(300+Math.min(1,f2)*2000,actx.currentTime,0.05);}
+  draw(wp,L,f2,mouth);
+  $('info').textContent=state==='intro'?'':`目标 ${Math.round(target*100)}% ±${Math.round(tol*100)}%`;
+  requestAnimationFrame(loop);
+}
+
+function draw(wp,L,f,mouth){
+  const g0=ctx.createLinearGradient(0,0,0,H);g0.addColorStop(0,'#232b3d');g0.addColorStop(1,'#151a26');
+  ctx.fillStyle=g0;ctx.fillRect(0,0,W,H);
+  if(W>H){ctx.fillStyle='#f2a541';ctx.font='18px sans-serif';ctx.textAlign='center';ctx.fillText('请把手机锁定竖屏再玩',W/2,H/2);return;}
+  // 桌面
+  ctx.fillStyle='rgba(255,255,255,.05)';ctx.fillRect(0,G.top+G.h,W,H);
+  // 杯子目标带
+  const gl=G.cx-G.w/2,yT=G.top+G.h*(1-(target+tol)),yB=G.top+G.h*(1-(target-tol)),yC=G.top+G.h*(1-target);
+  const near=f>=target-tol-0.07;
+  ctx.fillStyle=near?'rgba(242,165,65,.38)':'rgba(242,165,65,.16)';
+  ctx.fillRect(gl,yT,G.w,yB-yT);
+  // 杯中液体
+  const lh=G.h*Math.min(1,f);
+  if(lh>0){const lg=ctx.createLinearGradient(0,G.top+G.h-lh,0,G.top+G.h);lg.addColorStop(0,'#ffb35c');lg.addColorStop(1,'#e2662b');
+    ctx.fillStyle=lg;ctx.fillRect(gl+2,G.top+G.h-lh,G.w-4,lh);
+    ctx.fillStyle='rgba(255,240,210,.6)';ctx.fillRect(gl+2,G.top+G.h-lh,G.w-4,2);}
+  ctx.strokeStyle='rgba(242,165,65,.9)';ctx.setLineDash([5,4]);ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.moveTo(gl-8,yC);ctx.lineTo(gl+G.w+8,yC);ctx.stroke();ctx.setLineDash([]);
+  // 杯身
+  ctx.strokeStyle='rgba(230,240,255,.8)';ctx.lineWidth=3;
+  ctx.beginPath();ctx.moveTo(gl,G.top);ctx.lineTo(gl,G.top+G.h);ctx.lineTo(gl+G.w,G.top+G.h);ctx.lineTo(gl+G.w,G.top);ctx.stroke();
+  ctx.fillStyle='rgba(255,255,255,.06)';ctx.fillRect(gl+6,G.top+6,6,G.h-12);
+  ctx.fillStyle='#eef1f7';ctx.font='13px sans-serif';ctx.textAlign='left';
+  ctx.fillText(Math.round(target*100)+'%',gl+G.w+10,yC+4);
+  ctx.textAlign='center';ctx.fillText('现在 '+(f*100).toFixed(1)+'%',G.cx,G.top+G.h+22);
+  // 水流
+  ctx.fillStyle='#ff9a45';
+  for(const p of parts){ctx.beginPath();ctx.arc(p.x,p.y,2.6,0,6.283);ctx.fill();}
+  // 瓶中液体
+  ctx.save();ctx.beginPath();wp.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.closePath();
+  ctx.fillStyle='rgba(255,255,255,.07)';ctx.fill();ctx.clip();
+  if(vb>0){const lg=ctx.createLinearGradient(0,L,0,L+B.bh);lg.addColorStop(0,'#ffb35c');lg.addColorStop(1,'#d9541f');ctx.fillStyle=lg;ctx.fillRect(0,L,W,H);
+    ctx.fillStyle='rgba(255,240,210,.7)';ctx.fillRect(0,L,W,2);}
+  ctx.restore();
+  ctx.beginPath();wp.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.closePath();
+  ctx.strokeStyle='rgba(230,240,255,.85)';ctx.lineWidth=3;ctx.lineJoin='round';ctx.stroke();
+  // 调试信息
+  ctx.fillStyle='rgba(238,241,247,.5)';ctx.font='11px sans-serif';ctx.textAlign='left';
+  ctx.fillText(`倾斜 ${theta.toFixed(0)}°  抖动 ${sigma.toFixed(2)}°  ${useDrag?'手指模式':(haveMotion?'重力传感器':'陀螺仪')}`,14,H-46);
+}
+intro();requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
